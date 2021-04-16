@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 
 """FoLiA to Salt XML conversion. Can in turn be used by Pepper for further conversion to other formats."""
-
 import sys
 import os
 import argparse
@@ -11,15 +10,19 @@ import lxml.etree
 from lxml.builder import ElementMaker
 from foliatools import VERSION as TOOLVERSION
 import folia.main as folia
-
 E = ElementMaker(nsmap={"sDocumentStructure":"sDocumentStructure", "xmi":"http://www.omg.org/XMI", "xsi": "http://www.w3.org/2001/XMLSchema-instance", "saltCore":"saltCore","saltCommon":"saltCommon", "sCorpusStructure":"sCorpusStructure" })
+DESCRIPTION_TAGS = []
 
+# Biech specific imports
+from feats import FEAT_DICT
+from Blogger import Blogger
+logger = Blogger()
 
 def processdir(d, **kwargs):
     print("Searching in  " + d,file=sys.stderr)
     corpusdocs = []
     extension = kwargs.get('extension','xml').strip('.')
-    for f in glob.glob(os.path.join(d ,'*')):
+    for ix, f in enumerate(glob.glob(os.path.join(d ,'*'))):
         if f[-len(extension) - 1:] == '.' + extension:
             _, corpusdoc = convert(f, **kwargs)
             corpusdocs.append(corpusdoc)
@@ -33,17 +36,20 @@ def convert(f, **kwargs):
     doc = folia.Document(file=f)
     if not doc.declared(folia.AnnotationType.TOKEN):
         raise Exception("Only tokenized documents can be handled at the moment")
-
     layers = OrderedDict()
-
+    # return convert_tokens(doc, layers, **kwargs)
     nodes, textrelations, text, phonrelations, phon, map_id_to_nodenr, nodes_seqnr = convert_tokens(doc, layers, **kwargs)
 
-    structure_nodes, structure_spanningrelations, nodes_seqnr = convert_structure_annotations(doc, layers, map_id_to_nodenr, nodes_seqnr, **kwargs)
-    span_nodes, span_spanningrelations, nodes_seqnr = convert_span_annotations(doc, layers, map_id_to_nodenr, nodes_seqnr, **kwargs)
+    #structure_nodes, structure_spanningrelations, nodes_seqnr = convert_structure_annotations(doc, layers, map_id_to_nodenr, nodes_seqnr, **kwargs)
+    #span_nodes, span_spanningrelations, nodes_seqnr = convert_span_annotations(doc, layers, map_id_to_nodenr, nodes_seqnr, **kwargs)
     syntax_nodes, syntax_dominancerelations, nodes_seqnr = convert_syntax_annotation(doc, layers, map_id_to_nodenr, nodes_seqnr, **kwargs)
 
-    nodes += structure_nodes + span_nodes + syntax_nodes
-    edges = textrelations + structure_spanningrelations + span_spanningrelations + syntax_dominancerelations
+    # nodes += structure_nodes + span_nodes + syntax_nodes
+    nodes += syntax_nodes
+
+
+    #edges = textrelations + structure_spanningrelations + span_spanningrelations + syntax_dominancerelations
+    edges = textrelations + syntax_dominancerelations
 
     layers = list(build_layers(layers, nodes, edges)) #this modifies the nodes and edges as well
 
@@ -61,15 +67,15 @@ def convert(f, **kwargs):
         *layers)
 
 
-    metadata = []
-    if doc.metadata:
-        for key, value in doc.metadata.items():
-            metadata.append( E.labels({
-                "{http://www.w3.org/2001/XMLSchema-instance}type": "saltCore:SMetaAnnotation",
-                "namespace": "FoLiA::meta",
-                "name": key,
-                "value": "T::" + str(value)
-            }) )
+    # metadata = []
+    # if doc.metadata:
+    #     for key, value in doc.metadata.items():
+    #         metadata.append( E.labels({
+    #             "{http://www.w3.org/2001/XMLSchema-instance}type": "saltCore:SMetaAnnotation",
+    #             "namespace": "FoLiA::meta",
+    #             "name": key,
+    #             "value": "T::" + str(value)
+    #         }) )
 
 
     corpusdoc = E.nodes( #sDocument
@@ -96,8 +102,8 @@ def convert(f, **kwargs):
                             "namespace": "salt",
                             "name": "SDOCUMENT_GRAPH_LOCATION",
                             "value": "T::file:" + os.path.join(os.path.realpath(kwargs['outputdir']), kwargs['corpusprefix'], doc.id + ".salt")
-                        }),
-                        *metadata
+                        })
+                        # *metadata
                         )
 
 
@@ -135,13 +141,39 @@ def convert_tokens(doc, layers, **kwargs):
             phonnode = nodes_seqnr
             nodes_seqnr += 1
 
+    # token_namespaces = []
+    # for word in doc.words():
+    #     if token_namespace is None:
+    #         #only needs to be done once
+    #         layer, token_namespace = init_layer(layers, word)
+    #     token_namespaces.append((word, token_namespace))
+    # return token_namespaces
+
+
+    # PARKER CHANGES
+    # Create utterance node
+
+    sstructure_ix = 0
+    dom_rel_ix = 0 # Tracks id of current dominance relation ids
+    node_ix = 0 # Tracks id of current node
+    sstructure_node_ids = {}
     for word in doc.words():
+        print([i for i in word.json()['children'] if i['type'] == 'pos'])
+
+        if word.parent.json()['id'] not in sstructure_node_ids:
+            assert word.parent.json()['type'] == 'utt'
+            print(word.parent.json()['id'])
+            sstructure_ix+=1
+            node_ix += 1
+            tokens.append(create_sstructure(doc, sstructure_ix, **kwargs))
+            sstructure_node_ids[word.parent.json()['id']] = node_ix
+
+        # Word is just the text token
         if not word.id:
             raise Exception("Only documents in which all words have IDs can be converted. Consider preprocessing with foliaid first.")
         if token_namespace is None:
             #only needs to be done once
             layer, token_namespace = init_layer(layers, word)
-
         textstart = len(text)
         try:
             text += word.text()
@@ -159,25 +191,32 @@ def convert_tokens(doc, layers, **kwargs):
         word.nodes_seqnr = nodes_seqnr #associate it with the folia temporarily for a quick lookup later
         map_id_to_nodenr[word.id] = nodes_seqnr
         layer['nodes'].append(nodes_seqnr)
-        nodes_seqnr += 1
 
         tokens.append(
             E.nodes({
                 "{http://www.w3.org/2001/XMLSchema-instance}type": "sDocumentStructure:SToken",
                     },
                     *convert_identifier(word, **kwargs),
-                    *convert_type_information(word, **kwargs),
-                    *convert_common_attributes(word,token_namespace, **kwargs),
+                    # *convert_type_information(word, **kwargs),
+                    *convert_common_attributes(word, token_namespace, **kwargs),
                     *convert_inline_annotations(word, layers, **kwargs)
             )
         )
-
+        node_ix += 1
+        # Node ids correspond to each items index in tokens list
+        if word.parent.json()['type'] == 'utt':
+            dom_rel_ix += 1
+            tokens.append(create_dominance_relation(doc, dom_rel_ix, sstructure_node_ids[word.parent.json()['id']], node_ix, **kwargs))
 
         if text and textstart != textend:
+            print(word.text())
+            print(node_ix)
+            print(textnode)
+            print()
             textrelations.append(
                 E.edges({
                     "{http://www.w3.org/2001/XMLSchema-instance}type": "sDocumentStructure:STextualRelation",
-                        "source": f"//@nodes.{nodes_seqnr}",
+                        "source": f"//@nodes.{node_ix}",
                         "target": f"//@nodes.{textnode}"
                         },
                         E.labels({
@@ -244,7 +283,7 @@ def convert_tokens(doc, layers, **kwargs):
                 )
             )
 
-
+        nodes_seqnr += 1
         prevword = word
 
     nodes = []
@@ -313,16 +352,19 @@ def init_layer(layers, element):
 
 def build_layers(layers, nodes, edges):
     """Builds the final salt layers from the temporary structure and modifies nodes and edges accordingly (adding the @layer attribute)"""
+    print(nodes)
     for i, (namespace, layer) in enumerate(layers.items()):
         for n in layer["nodes"]:
-            if "layers" in nodes[n].attrib:
-                nodes[n].attrib["layers"] += f" //@layers.{i}"
-            else:
-                nodes[n].attrib["layers"] = f"//@layers.{i}"
-            if "layers" in edges[n].attrib:
-                edges[n].attrib["layers"] += f" //@layers.{i}"
-            else:
-                edges[n].attrib["layers"] = f"//@layers.{i}"
+            if n < len(nodes):
+                if "layers" in nodes[n].attrib:
+                    nodes[n].attrib["layers"] += f" //@layers.{i}"
+                else:
+                    nodes[n].attrib["layers"] = f"//@layers.{i}"
+            if n < len(edges):
+                if "layers" in edges[n].attrib:
+                    edges[n].attrib["layers"] += f" //@layers.{i}"
+                else:
+                    edges[n].attrib["layers"] = f"//@layers.{i}"
 
         yield E.layers({
             "{http://www.w3.org/2001/XMLSchema-instance}type": "saltCore:SLayer",
@@ -340,24 +382,6 @@ def build_layers(layers, nodes, edges):
                     "namespace": "salt",
                     "name": "SNAME",
                     "value": "T::" + layer['type'] + (" ("+ layer['set']+")" if layer['set'] else "")
-                }),
-                E.labels({
-                    "{http://www.w3.org/2001/XMLSchema-instance}type": "saltCore:SMetaAnnotation",
-                    "namespace": "FoLiA",
-                    "name": "set",
-                    "value": "T::" + layer['set']
-                }),
-                E.labels({
-                    "{http://www.w3.org/2001/XMLSchema-instance}type": "saltCore:SMetaAnnotation",
-                    "namespace": "FoLiA",
-                    "name": "annotationtype",
-                    "value": "T::" + layer['type']
-                }),
-                E.labels({
-                    "{http://www.w3.org/2001/XMLSchema-instance}type": "saltCore:SMetaAnnotation",
-                    "namespace": "FoLiA",
-                    "name": "namespace",
-                    "value": "T::" + namespace
                 })
             )
 
@@ -365,29 +389,48 @@ def build_layers(layers, nodes, edges):
 def convert_inline_annotations(word, layers, **kwargs):
     """Convert FoLiA inline annotations to salt SAnnotation labels on a token"""
     for annotation in word.select(folia.AbstractInlineAnnotation):
-        if kwargs['saltnamespace'] and (annotation.set is None or annotation.set == word.doc.defaultset(annotation.ANNOTATIONTYPE)):
+        # if kwargs['saltnamespace'] and (annotation.set is None or annotation.set == word.doc.defaultset(annotation.ANNOTATIONTYPE)):
            #add a simplified annotation in the Salt namespace, this facilitates
            #conversion to other formats
-           yield E.labels({
-               "{http://www.w3.org/2001/XMLSchema-instance}type": "saltCore:SAnnotation",
-                       "namespace": "salt",
-                       "name": annotation.XMLTAG,
-                       "value": "T::" + annotation.cls
-                   })
+       yield E.labels({
+           "{http://www.w3.org/2001/XMLSchema-instance}type": "saltCore:SAnnotation",
+                   "namespace": "salt",
+                   "name": annotation.XMLTAG,
+                   "value": "T::" + annotation.cls
+               })
+    """
+    Birch specific: grab desc annotations in <pos></pos> and convert to SAnnotations.
+    """
+    pos_annotations = [i for i in word.json()['children'] if i['type'] == 'pos']
+    for annotation in pos_annotations:
+        description = [i for i in annotation['children'] if i['type'] == 'desc']
+        if description:
+            for feat in description[0]['value'].split(','):
+                feat = feat.strip()
+                if not feat.strip() in FEAT_DICT:
+                    logger.yellow(f"ERROR: Unkown feature {feat}")
+                else:
+                    yield E.labels({
+                        "{http://www.w3.org/2001/XMLSchema-instance}type": "saltCore:SAnnotation",
+                            "namespace": "salt",
+                            "name": FEAT_DICT[feat],
+                            "value": "T::" + feat
+                    })
 
-        if not kwargs['saltonly']:
-            layer, namespace = init_layer(layers, annotation)
-            if word.nodes_seqnr is not None:
-                layer['nodes'].append(word.nodes_seqnr)
 
-            for x in convert_common_attributes(annotation, namespace, **kwargs):
-                yield x
-
-            for x in convert_features(annotation, namespace, **kwargs):
-                yield x
-
-            for x in convert_higher_order(annotation, namespace, **kwargs):
-                yield x
+        # if not kwargs['saltonly']:
+        #     layer, namespace = init_layer(layers, annotation)
+        #     if word.nodes_seqnr is not None:
+        #         layer['nodes'].append(word.nodes_seqnr)
+        #
+        #     for x in convert_common_attributes(annotation, namespace, **kwargs):
+        #         yield x
+        #
+        #     for x in convert_features(annotation, namespace, **kwargs):
+        #         yield x
+        #
+        #     for x in convert_higher_order(annotation, namespace, **kwargs):
+        #         yield x
 
 def convert_structure_annotations(doc, layers, map_id_to_nodenr, nodes_seqnr, **kwargs):
     """Convert FoLiA structure annotations (sentences, paragraphs, etc) to salt SSpan nodes and SSpaningRelation edges.
@@ -414,7 +457,7 @@ def convert_structure_annotations(doc, layers, map_id_to_nodenr, nodes_seqnr, **
                                 "value": "T::" + folia.annotationtype2str(structure.ANNOTATIONTYPE).lower()
                             }),
                             *convert_identifier(structure, **kwargs),
-                            *convert_type_information(structure, **kwargs),
+                            # *convert_type_information(structure, **kwargs),
                             *convert_common_attributes(structure, namespace, **kwargs),
                             *convert_features(structure, namespace, **kwargs),
                             *convert_higher_order(structure, namespace, **kwargs),
@@ -466,7 +509,7 @@ def convert_span_annotations(doc, layers, map_id_to_nodenr, nodes_seqnr, **kwarg
                             "{http://www.w3.org/2001/XMLSchema-instance}type": "sDocumentStructure:SSpan",
                             },
                             *convert_identifier(span, **kwargs),
-                            *convert_type_information(span, **kwargs),
+                            # *convert_type_information(span, **kwargs),
                             *convert_common_attributes(span, namespace, **kwargs),
                             *convert_features(span, namespace, **kwargs),
                             *convert_higher_order(span, namespace, **kwargs),
@@ -530,7 +573,7 @@ def convert_nested_span(span, layers, map_id_to_nodenr, nodes_seqnr, **kwargs):
                 "{http://www.w3.org/2001/XMLSchema-instance}type": "sDocumentStructure:SStructure", #salt calls nested hierarchies 'structure', not to be confused with what FoLiA calls structure (document structure)
                 },
                 *convert_identifier(span, **kwargs),
-                *convert_type_information(span, **kwargs),
+                # *convert_type_information(span, **kwargs),
                 *convert_common_attributes(span, namespace, **kwargs),
                 *convert_features(span, namespace, **kwargs),
                 *convert_higher_order(span, namespace, **kwargs),
@@ -578,22 +621,76 @@ def convert_identifier(annotation, **kwargs):
             "value": "T::" + annotation.id
         })
 
-def convert_type_information(annotation, **kwargs):
-    """Adds extra FoLiA type information as SMetaAnnotation labels (on salt nodes)"""
-    if annotation.XMLTAG:
-        yield E.labels({
-            "{http://www.w3.org/2001/XMLSchema-instance}type": "saltCore:SMetaAnnotation",
-            "namespace": "FoLiA",
-            "name": "elementtype",
-            "value": "T::" + annotation.XMLTAG
+def create_sstructure(doc, sstructure_ix, **kwargs):
+    """
+    Takes in doc and cat, and creates sstructure node to connect others to.
+    Also creates SDominanceRelation (?)
+        - cat is the name of the most parent node, something like "S" or "UTT".
+        - ID is passed in through sstructure_ix in kwargs.
+    """
+    return E.nodes({
+            "{http://www.w3.org/2001/XMLSchema-instance}type": "sDocumentStructure:SStructure"
+        },
+        E.labels({
+        "{http://www.w3.org/2001/XMLSchema-instance}type": "saltCore:SElementId",
+        "namespace": "salt",
+        "name": "id",
+        "value": "T::salt:/" + kwargs['corpusprefix'] + "/" + doc.id + '#' + str(sstructure_ix)
+        }),
+        E.labels({
+           "{http://www.w3.org/2001/XMLSchema-instance}type": "saltCore:SAnnotation",
+                   "namespace": "salt",
+                   "name": "cat",
+                   "value": "T::" + 'UTT'
+               }),
+        E.labels({
+            "{http://www.w3.org/2001/XMLSchema-instance}type": "saltCore:SFeature",
+            "namespace": "saltCommon",
+            "name": "SNAME",
+            "value": "T::structure" + str(sstructure_ix), #this can be huge!
         })
-    if annotation.ANNOTATIONTYPE:
-        yield E.labels({
-            "{http://www.w3.org/2001/XMLSchema-instance}type": "saltCore:SMetaAnnotation",
-            "namespace": "FoLiA",
-            "name": "annotationtype",
-            "value": "T::" + folia.annotationtype2str(annotation.ANNOTATIONTYPE).lower()
+    )
+
+def create_dominance_relation(doc, dom_rel_ix, source_node_ix, target_node_ix, **kwargs):
+    """
+    Creates a dominance relation between a root_node_ix (pointing to a sstructure) and a connected_node_ix (probably pointing to an SToken).
+    """
+    return E.edges({
+            "{http://www.w3.org/2001/XMLSchema-instance}type": "sDocumentStructure:SDominanceRelation",
+            "source": f"//@nodes.{source_node_ix}",
+            "target": f"//@nodes.{target_node_ix}"
+        },
+        E.labels({
+        "{http://www.w3.org/2001/XMLSchema-instance}type": "saltCore:SElementId",
+        "namespace": "salt",
+        "name": "id",
+        "value": "T::salt:/" + kwargs['corpusprefix'] + "/" + doc.id + '#' + str(dom_rel_ix)
+        }),
+        E.labels({
+            "{http://www.w3.org/2001/XMLSchema-instance}type": "saltCore:SFeature",
+            "namespace": "saltCommon",
+            "name": "SNAME",
+            "value": "T::structure" + str(dom_rel_ix), #this can be huge!
         })
+    )
+
+
+# def convert_type_information(annotation, **kwargs):
+#     """Adds extra FoLiA type information as SMetaAnnotation labels (on salt nodes)"""
+#     if annotation.XMLTAG:
+#         yield E.labels({
+#             "{http://www.w3.org/2001/XMLSchema-instance}type": "saltCore:SMetaAnnotation",
+#             "namespace": "FoLiA",
+#             "name": "elementtype",
+#             "value": "T::" + annotation.XMLTAG
+#         })
+#     if annotation.ANNOTATIONTYPE:
+#         yield E.labels({
+#             "{http://www.w3.org/2001/XMLSchema-instance}type": "saltCore:SMetaAnnotation",
+#             "namespace": "FoLiA",
+#             "name": "annotationtype",
+#             "value": "T::" + folia.annotationtype2str(annotation.ANNOTATIONTYPE).lower()
+#         })
 
 def convert_common_attributes(annotation,namespace, **kwargs):
     """Convert common FoLiA attributes as salt SMetaAnnotation labels (on salt nodes)"""
@@ -606,66 +703,6 @@ def convert_common_attributes(annotation,namespace, **kwargs):
                     "value": "T::" + annotation.cls
                 })
 
-    if annotation.id is not None:
-        yield E.labels({
-            "{http://www.w3.org/2001/XMLSchema-instance}type": "saltCore:SMetaAnnotation",
-                    "namespace": namespace,
-                    "name": "id",
-                    "value": "T::" + annotation.id
-                })
-
-    if annotation.confidence is not None:
-        yield E.labels({
-            "{http://www.w3.org/2001/XMLSchema-instance}type": "saltCore:SMetaAnnotation",
-                    "namespace": namespace,
-                    "name": "confidence",
-                    "value": "F::" + str(annotation.confidence)
-                })
-
-    if annotation.n is not None:
-        yield E.labels({
-            "{http://www.w3.org/2001/XMLSchema-instance}type": "saltCore:SMetaAnnotation",
-                    "namespace": namespace,
-                    "name": "n",
-                    "value": "T::" + annotation.n
-                })
-
-    if annotation.href is not None:
-        yield E.labels({
-            "{http://www.w3.org/2001/XMLSchema-instance}type": "saltCore:SMetaAnnotation",
-                    "namespace": namespace,
-                    "name": "href",
-                    "value": "T::" + annotation.href
-                })
-
-    if annotation.datetime is not None:
-        yield E.labels({
-            "{http://www.w3.org/2001/XMLSchema-instance}type": "saltCore:SMetaAnnotation",
-                    "namespace": namespace,
-                    "name": "datetime",
-                    "value": "T::" + annotation.datetime.strftime("%Y-%m-%dT%H:%M:%S") #MAYBE TODO: I'm not sure if XMI/salt has a specific date type possibly?
-                })
-
-
-    if annotation.processor:
-        yield E.labels({
-            "{http://www.w3.org/2001/XMLSchema-instance}type": "saltCore:SMetaAnnotation",
-                    "namespace": namespace,
-                    "name": "processor/id",
-                    "value": "T::" + annotation.processor.id
-                })
-        yield E.labels({
-            "{http://www.w3.org/2001/XMLSchema-instance}type": "saltCore:SMetaAnnotation",
-                    "namespace": namespace,
-                    "name": "processor/name",
-                    "value": "T::" + annotation.processor.name
-                })
-        yield E.labels({
-            "{http://www.w3.org/2001/XMLSchema-instance}type": "saltCore:SMetaAnnotation",
-                    "namespace": namespace,
-                    "name": "processor/type",
-                    "value": "T::" + annotation.processor.type
-                })
 
 def convert_features(annotation, namespace, **kwargs):
     """Convert FoLiA features to SAnnotation labels (on salt nodes)"""
@@ -763,32 +800,71 @@ def main():
     parser.add_argument('--corpusprefix','-p', type=str, help="Corpus prefix for salt", action='store', default="foliacorpus",required=False)
     parser.add_argument('--saltnamespace','-s',help="Add simplified annotations in the salt namespace", action='store_true', required=False, default=False)
     parser.add_argument('--outputdir','-o',type=str, help="Output directory", action='store', default=".", required=False)
-    parser.add_argument('--saltonly','-S',help="Skip complex annotations not in the salt namespace (use with --saltnamespace). This will ignore a lot of the information FoLiA provides!", action='store_true', required=False, default=False)
+    parser.add_argument('--saltonly','-S',help="Skip complex annotations not in the salt namespace (use with --saltnamespace). This will ignore a lot of the information FoLiA provides!", action='store_true', required=False, default=True)
     parser.add_argument('files', nargs='*', help='Files (and/or directories) to convert')
     args = parser.parse_args()
 
-
     os.makedirs(os.path.join(os.path.realpath(args.outputdir), args.corpusprefix), exist_ok=True)
     kwargs = args.__dict__
-
     if args.files:
         corpusdocs = []
         skipnext = False
         for file in args.files:
             if os.path.isdir(file):
-                corpusdocs += processdir(file, **args.__dict__)
+                corpusdocs += processdir(file, **kwargs)
             elif os.path.isfile(file):
-                saltdoc, corpusdoc = convert(file, **args.__dict__)
+                saltdoc, corpusdoc = convert(file, **kwargs)
                 corpusdocs.append(corpusdoc)
             else:
                 print("ERROR: File or directory not found: " + file,file=sys.stderr)
                 sys.exit(3)
         if not corpusdocs:
             sys.exit(1)
-        convert_corpus(corpusdocs, **args.__dict__)
+        convert_corpus(corpusdocs, **kwargs)
     else:
         print("ERROR: No files specified. Add --help for usage details.",file=sys.stderr)
         sys.exit(2)
 
 if __name__ == "__main__":
     main()
+
+
+
+def testing():
+    import pickle
+    with open('/Users/parkerglenn/Desktop/Brandeis/birch/foliatools/foliatools/example_args.pkl', 'rb') as f:
+        args = pickle.load(f)
+    kwargs = args.__dict__
+    file = '/Users/parkerglenn/Desktop/Brandeis/birch/folia-testing/folia_test_document/pos.2.0.0.folia.xml'
+
+    doc = convert(file, **args.__dict__)
+
+    dir(doc)
+    for word in doc.words():
+        print(word)
+
+    s = word.parent
+    dir(s)
+    word.parent.json()['type']
+    s.json()
+    s.id
+    s.xmlstring()
+
+    s.text()
+    dir(word)
+
+
+    word, token_namespace = token_namespaces[0]
+    dir(word)
+    word.elements()
+    for annotation in word.select(folia.AbstractInlineAnnotation):
+        print(annotation.cls)
+
+
+
+    for word in [i[0] for i in token_namespaces]:
+        print(word.text())
+"""
+TODO:
+    - Bump up STextualRelation IDs by 1, since we're adding in SStructures that increment the node count
+"""
