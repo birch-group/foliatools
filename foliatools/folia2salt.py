@@ -290,26 +290,49 @@ def convert_tokens(doc, layers, **kwargs):
     if text:
         nodes.append( E.nodes({
             "{http://www.w3.org/2001/XMLSchema-instance}type": "sDocumentStructure:STextualDS",
+        """
+        Birch specific: grab desc annotations in <pos></pos> and convert to SSpan.
+        """
+        word_ix = node_ix - 1
+        pos_annotations = [i for i in word.json()['children'] if i['type'] == 'pos']
+        for annotation in pos_annotations:
+            description = [i for i in annotation['children'] if i['type'] == 'desc']
+            if description:
+                for feat in description[0]['value'].split(','):
+                    feat = feat.strip()
+                    if not feat.strip() in FEAT_DICT:
+                        logger.yellow(f"ERROR: Unkown feature {feat}")
+                    else:
+                        sspan_id = str(sum([len(i) for i in sspan_relations.values()]))
+                        tokens.append(
+                            E.nodes({
+                                "{http://www.w3.org/2001/XMLSchema-instance}type": "sDocumentStructure:SSpan",
                             },
                             E.labels({
-                                "{http://www.w3.org/2001/XMLSchema-instance}type": "saltCore:SFeature",
-                                "namespace": "saltCommon",
-                                "name": "SDATA",
-                                "value": "T::" + text, #this can be huge!
-                            }),
-                            E.labels({
-                                "{http://www.w3.org/2001/XMLSchema-instance}type": "saltCore:SElementId",
+                                 "{http://www.w3.org/2001/XMLSchema-instance}type": "saltCore:SElementId",
                                 "namespace": "salt",
                                 "name": "id",
-                                "value": "T::salt:/" + kwargs['corpusprefix'] + "/" + doc.id + '#TextContent'
+                                "value": "T::salt:/" + kwargs['corpusprefix'] + "/" + doc.id + '#sSpan' + sspan_id
                             }),
                             E.labels({
                                 "{http://www.w3.org/2001/XMLSchema-instance}type": "saltCore:SFeature",
                                 "namespace": "salt",
                                 "name": "SNAME",
-                                "value": "T::TextContent"
+                                "value": "T::SSpan" + sspan_id
                             }),
-                    ))
+                            E.labels({
+                                "{http://www.w3.org/2001/XMLSchema-instance}type": "saltCore:SAnnotation",
+                                    "namespace": "morph",
+                                    "name": FEAT_DICT[feat],
+                                    "value": "T::" + feat
+                            }),
+                        ))
+                        # now we log to sspan_relations
+                        if word_ix not in sspan_relations:
+                            sspan_relations[word_ix] = [node_ix]
+                        else:
+                            sspan_relations[word_ix].append(node_ix)
+                        node_ix += 1
     if phon:
         nodes.append(E.nodes({
             "{http://www.w3.org/2001/XMLSchema-instance}type": "sDocumentStructure:STextualDS",
