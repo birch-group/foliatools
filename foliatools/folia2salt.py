@@ -13,10 +13,32 @@ import folia.main as folia
 E = ElementMaker(nsmap={"sDocumentStructure":"sDocumentStructure", "xmi":"http://www.omg.org/XMI", "xsi": "http://www.w3.org/2001/XMLSchema-instance", "saltCore":"saltCore","saltCommon":"saltCommon", "sCorpusStructure":"sCorpusStructure" })
 DESCRIPTION_TAGS = []
 
-# Biech specific imports
+# Birch specific imports
 from feats import FEAT_DICT
 from Blogger import Blogger
+import xmltodict as xd
 logger = Blogger()
+
+# Defining which nodes to ignore when adding layer info
+BASE_LAYERS =  ['sDocumentStructure:STextualDS',
+                'sDocumentStructure:SAudioDS',
+                ]
+"""
+TODO:
+    - Add support for corresponding audio files
+        - From https://raw.githubusercontent.com/korpling/salt/master/gh-site/doc/salt_modelGuide.pdf:
+        - 'To  create  an  audio  annotation, theSAnnotation.sValue must be set to an URI pointing to the audio file'
+        - SAudioDSRelation behaves similar to STextualRelation tags
+"""
+
+#################################################
+                # Tools #
+#################################################
+def etree_to_dict(t):
+    d = {t.tag : map(etree_to_dict, t.iterchildren())}
+    d.update(('@' + k, v) for k, v in t.attrib.iteritems())
+    d['text'] = t.text
+    return d
 
 def processdir(d, **kwargs):
     print("Searching in  " + d,file=sys.stderr)
@@ -30,6 +52,26 @@ def processdir(d, **kwargs):
             corpusdocs += processdir(f,**kwargs)
     return corpusdocs
 
+def time_tuple_to_string(t):
+    """
+    Formats Folia Doc time tuple to string for Salt Doc time relation.
+    e.g. (0, 0, 2, 100) --> 00:00:02.100
+    """
+    out = ""
+    for ix, item in enumerate(t):
+        if ix == 3:
+            out += f'.{str(item)}'
+        elif len(str(item)) == 1:
+            out += f':0{str(item)}'
+        else:
+            out += f':{str(item)}'
+        if ix == 1:
+            out = out[1:]
+    return out
+
+#################################################
+                # Conversion Scripts #
+#################################################
 def convert(f, **kwargs):
     """Convert a FoLiA document to Salt XML"""
     success = False
@@ -38,20 +80,11 @@ def convert(f, **kwargs):
         raise Exception("Only tokenized documents can be handled at the moment")
     layers = OrderedDict()
     # return convert_tokens(doc, layers, **kwargs)
-    nodes, textrelations, text, phonrelations, phon, map_id_to_nodenr, nodes_seqnr = convert_tokens(doc, layers, **kwargs)
+    nodes, textrelations, text, phonrelations, phon, map_id_to_nodenr, nodes_seqnr, node_ix = convert_tokens(doc, layers, **kwargs)
 
-    #structure_nodes, structure_spanningrelations, nodes_seqnr = convert_structure_annotations(doc, layers, map_id_to_nodenr, nodes_seqnr, **kwargs)
-    #span_nodes, span_spanningrelations, nodes_seqnr = convert_span_annotations(doc, layers, map_id_to_nodenr, nodes_seqnr, **kwargs)
-    syntax_nodes, syntax_dominancerelations, nodes_seqnr = convert_syntax_annotation(doc, layers, map_id_to_nodenr, nodes_seqnr, **kwargs)
+    edges = textrelations
 
-    # nodes += structure_nodes + span_nodes + syntax_nodes
-    nodes += syntax_nodes
-
-
-    #edges = textrelations + structure_spanningrelations + span_spanningrelations + syntax_dominancerelations
-    edges = textrelations + syntax_dominancerelations
-
-    layers = list(build_layers(layers, nodes, edges)) #this modifies the nodes and edges as well
+    layers = list(build_layers(layers, nodes, edges, node_ix)) #this modifies the nodes and edges as well
 
     #Create the document (sDocumentGraph)
     saltdoc = getattr(E,"{sDocumentStructure}SDocumentGraph")(
@@ -65,17 +98,6 @@ def convert(f, **kwargs):
         *nodes,
         *edges,
         *layers)
-
-
-    # metadata = []
-    # if doc.metadata:
-    #     for key, value in doc.metadata.items():
-    #         metadata.append( E.labels({
-    #             "{http://www.w3.org/2001/XMLSchema-instance}type": "saltCore:SMetaAnnotation",
-    #             "namespace": "FoLiA::meta",
-    #             "name": key,
-    #             "value": "T::" + str(value)
-    #         }) )
 
 
     corpusdoc = E.nodes( #sDocument
@@ -116,6 +138,9 @@ def convert(f, **kwargs):
 
 def convert_tokens(doc, layers, **kwargs):
     """Convert FoLiA tokens (w) to salt nodes. This function also extracts the text layer and links to it."""
+    audio_uri = "/Users/parkerglenn/Desktop/Brandeis/birch/folia2annis/010181.m4a"
+    audio = True
+
     tokens = []
     textrelations = []
     phonrelations = []
@@ -141,32 +166,36 @@ def convert_tokens(doc, layers, **kwargs):
             phonnode = nodes_seqnr
             nodes_seqnr += 1
 
-    # token_namespaces = []
-    # for word in doc.words():
-    #     if token_namespace is None:
-    #         #only needs to be done once
-    #         layer, token_namespace = init_layer(layers, word)
-    #     token_namespaces.append((word, token_namespace))
-    # return token_namespaces
-
-
     # PARKER CHANGES
     # Create utterance node
 
     sstructure_ix = 0
     dom_rel_ix = 0 # Tracks id of current dominance relation ids
-    node_ix = 0 # Tracks id of current node
-    sstructure_node_ids = {}
-    for word in doc.words():
-        print([i for i in word.json()['children'] if i['type'] == 'pos'])
 
-        if word.parent.json()['id'] not in sstructure_node_ids:
+    """
+    Tracks index of current node. Starts at 3, since birch salt documents begin with:
+        - SAudioDS
+        - STimeline
+        - STextualDS
+    """
+    # node_ix = 2 if audio else 1
+    node_ix = len(BASE_LAYERS)
+    sstructure_data = OrderedDict() # Tracks id as keys, with node_ix and audio span info as values
+    sspan_relations = OrderedDict() # Tracks word id as keys, with SSpan ids as values
+
+    for word in doc.words():
+        # print([i for i in word.json()['children'] if i['type'] == 'pos'])
+
+        if word.parent.id not in sstructure_data:
+            # Create Sstructure and link audio
             assert word.parent.json()['type'] == 'utt'
-            print(word.parent.json()['id'])
+            tokens.append(create_sstructure(doc, sstructure_ix, **kwargs))
+            sstructure_data[word.parent.id] = {}
+            sstructure_data[word.parent.id]['node_ix'] = node_ix
+            sstructure_data[word.parent.id]['audio_begin'] = time_tuple_to_string(word.parent.begintime)
+            sstructure_data[word.parent.id]['audio_end'] = time_tuple_to_string(word.parent.endtime)
             sstructure_ix+=1
             node_ix += 1
-            tokens.append(create_sstructure(doc, sstructure_ix, **kwargs))
-            sstructure_node_ids[word.parent.json()['id']] = node_ix
 
         # Word is just the text token
         if not word.id:
@@ -191,7 +220,9 @@ def convert_tokens(doc, layers, **kwargs):
         word.nodes_seqnr = nodes_seqnr #associate it with the folia temporarily for a quick lookup later
         map_id_to_nodenr[word.id] = nodes_seqnr
         layer['nodes'].append(nodes_seqnr)
-
+        # print("NODE SEQNR:")
+        # print(nodes_seqnr)
+        # print(node_ix)
         tokens.append(
             E.nodes({
                 "{http://www.w3.org/2001/XMLSchema-instance}type": "sDocumentStructure:SToken",
@@ -202,17 +233,17 @@ def convert_tokens(doc, layers, **kwargs):
                     *convert_inline_annotations(word, layers, **kwargs)
             )
         )
-        node_ix += 1
         # Node ids correspond to each items index in tokens list
         if word.parent.json()['type'] == 'utt':
             dom_rel_ix += 1
-            tokens.append(create_dominance_relation(doc, dom_rel_ix, sstructure_node_ids[word.parent.json()['id']], node_ix, **kwargs))
+            tokens.append(create_dominance_relation(doc, dom_rel_ix, sstructure_data[word.parent.id]['node_ix'], node_ix, **kwargs))
+
 
         if text and textstart != textend:
-            print(word.text())
-            print(node_ix)
-            print(textnode)
-            print()
+            # print(word.text())
+            # print(node_ix)
+            # print(textnode)
+            # print()
             textrelations.append(
                 E.edges({
                     "{http://www.w3.org/2001/XMLSchema-instance}type": "sDocumentStructure:STextualRelation",
@@ -285,11 +316,8 @@ def convert_tokens(doc, layers, **kwargs):
 
         nodes_seqnr += 1
         prevword = word
+        node_ix += 1
 
-    nodes = []
-    if text:
-        nodes.append( E.nodes({
-            "{http://www.w3.org/2001/XMLSchema-instance}type": "sDocumentStructure:STextualDS",
         """
         Birch specific: grab desc annotations in <pos></pos> and convert to SSpan.
         """
@@ -333,6 +361,140 @@ def convert_tokens(doc, layers, **kwargs):
                         else:
                             sspan_relations[word_ix].append(node_ix)
                         node_ix += 1
+
+    # Backtracking over accumulated sstructures outside of loop
+    if audio:
+        for ix, (sstructure_id, data) in enumerate(sstructure_data.items()):
+            # print("ID:")
+            # print(sstructure_id)
+            textrelations.append(
+                E.edges({
+                    "{http://www.w3.org/2001/XMLSchema-instance}type": "sDocumentStructure:SAudioRelation",
+                        "source": f"//@nodes.{data['node_ix']}",
+                        "target": f"//@nodes.2"
+                        },
+                        E.labels({
+                            "{http://www.w3.org/2001/XMLSchema-instance}type": "saltCore:SElementId",
+                            "namespace": "salt",
+                            "name": "id",
+                            "value": "T::salt:/" + kwargs['corpusprefix'] + "/" + doc.id + '#sAudioRel' + str(ix)
+                        }),
+                        E.labels({
+                            "{http://www.w3.org/2001/XMLSchema-instance}type": "saltCore:SFeature",
+                            "namespace": "salt",
+                            "name": "SNAME",
+                            "value": "T::sAudioRel" + str(ix)
+                        }),
+                        E.labels({
+                            "{http://www.w3.org/2001/XMLSchema-instance}type": "saltCore:SFeature",
+                            "namespace": "salt",
+                            "name": "SSTART",
+                            "value": data['audio_begin']
+                        }),
+                        E.labels({
+                            "{http://www.w3.org/2001/XMLSchema-instance}type": "saltCore:SFeature",
+                            "namespace": "salt",
+                            "name": "SEND",
+                            "value": data['audio_end']
+                        })
+                )
+            )
+
+
+    # Backtracking over accumulated sspans and linking with SSpanningRelations
+    sspan_rel_id=0
+    for word_node_ix, sspan_node_ixs in sspan_relations.items():
+        for sspan_node_ix in sspan_node_ixs:
+            textrelations.append(
+                 E.edges({
+                     "{http://www.w3.org/2001/XMLSchema-instance}type": "sDocumentStructure:SSpanningRelation",
+                         "source": f"//@nodes.{sspan_node_ix}",
+                         "target": f"//@nodes.{word_node_ix}",
+                     },
+                 E.labels({
+                     "{http://www.w3.org/2001/XMLSchema-instance}type": "saltCore:SElementId",
+                    "namespace": "salt",
+                    "name": "id",
+                    "value": "T::salt:/" + kwargs['corpusprefix'] + "/" + doc.id + '#SSpanningRelation' + str(sspan_rel_id)
+                }),
+                E.labels({
+                    "{http://www.w3.org/2001/XMLSchema-instance}type": "saltCore:SFeature",
+                    "namespace": "salt",
+                    "name": "SNAME",
+                    "value": "T::SSpanningRelation" + str(sspan_rel_id)
+                }),
+
+            ))
+            sspan_rel_id += 1
+
+
+    nodes = []
+    if text:
+        if "sDocumentStructure:STextualDS" in BASE_LAYERS:
+            nodes.append( E.nodes({
+                "{http://www.w3.org/2001/XMLSchema-instance}type": "sDocumentStructure:STextualDS",
+                                },
+                                E.labels({
+                                    "{http://www.w3.org/2001/XMLSchema-instance}type": "saltCore:SFeature",
+                                    "namespace": "saltCommon",
+                                    "name": "SDATA",
+                                    "value": "T::" + text, #this can be huge!
+                                }),
+                                E.labels({
+                                    "{http://www.w3.org/2001/XMLSchema-instance}type": "saltCore:SElementId",
+                                    "namespace": "salt",
+                                    "name": "id",
+                                    "value": "T::salt:/" + kwargs['corpusprefix'] + "/" + doc.id + '#TextContent'
+                                }),
+                                E.labels({
+                                    "{http://www.w3.org/2001/XMLSchema-instance}type": "saltCore:SFeature",
+                                    "namespace": "salt",
+                                    "name": "SNAME",
+                                    "value": "T::TextContent"
+                                }),
+                        ))
+    if audio:
+        if "sDocumentStructure:STimeline" in BASE_LAYERS:
+            nodes.append( E.nodes({
+                "{http://www.w3.org/2001/XMLSchema-instance}type": "sDocumentStructure:STimeline",
+                                },
+                                E.labels({
+                                    "{http://www.w3.org/2001/XMLSchema-instance}type": "saltCore:SElementId",
+                                    "namespace": "salt",
+                                    "name": "id",
+                                    "value": "T::salt:/" + kwargs['corpusprefix'] + "/" + doc.id + '#TimelineContent'
+                                }),
+                                E.labels({
+                                    "{http://www.w3.org/2001/XMLSchema-instance}type": "saltCore:SFeature",
+                                    "namespace": "salt",
+                                    "name": "SNAME",
+                                    "value": "T::TimelineContent"
+                                }),
+                        ))
+        if "sDocumentStructure:SAudioDS" in BASE_LAYERS:
+            nodes.append( E.nodes({
+                "{http://www.w3.org/2001/XMLSchema-instance}type": "sDocumentStructure:SAudioDS",
+                                },
+                                E.labels({
+                                    "{http://www.w3.org/2001/XMLSchema-instance}type": "saltCore:sFeature",
+                                    "namespace": "saltCommon",
+                                    "name": "SAUDIO_REFERENCE",
+                                    "value": "U::file:" + audio_uri
+                                }),
+                                E.labels({
+                                    "{http://www.w3.org/2001/XMLSchema-instance}type": "saltCore:SElementId",
+                                    "namespace": "salt",
+                                    "name": "id",
+                                    "value": "T::salt:/" + kwargs['corpusprefix'] + "/" + doc.id + '#AudioContent'
+                                }),
+                                E.labels({
+                                    "{http://www.w3.org/2001/XMLSchema-instance}type": "saltCore:SFeature",
+                                    "namespace": "salt",
+                                    "name": "SNAME",
+                                    "value": "T::AudioContent"
+                                }),
+                        ))
+
     if phon:
         nodes.append(E.nodes({
             "{http://www.w3.org/2001/XMLSchema-instance}type": "sDocumentStructure:STextualDS",
@@ -357,7 +519,7 @@ def convert_tokens(doc, layers, **kwargs):
                             }),
                     ))
     nodes += tokens
-    return (nodes, textrelations, text, phonrelations, phon, map_id_to_nodenr, nodes_seqnr)
+    return (nodes, textrelations, text, phonrelations, phon, map_id_to_nodenr, nodes_seqnr, node_ix)
 
 def init_layer(layers, element):
     """Initialises a salt layer (in a temporary structure) and computes the namespace for a certain annotation type"""
@@ -373,25 +535,26 @@ def init_layer(layers, element):
         }
     return (layers[namespace], namespace)
 
-def build_layers(layers, nodes, edges):
+def build_layers(layers, nodes, edges, node_ix):
     """Builds the final salt layers from the temporary structure and modifies nodes and edges accordingly (adding the @layer attribute)"""
-    print(nodes)
     for i, (namespace, layer) in enumerate(layers.items()):
         for n in layer["nodes"]:
-            if n < len(nodes):
-                if "layers" in nodes[n].attrib:
-                    nodes[n].attrib["layers"] += f" //@layers.{i}"
-                else:
-                    nodes[n].attrib["layers"] = f"//@layers.{i}"
-            if n < len(edges):
-                if "layers" in edges[n].attrib:
-                    edges[n].attrib["layers"] += f" //@layers.{i}"
-                else:
-                    edges[n].attrib["layers"] = f"//@layers.{i}"
+            # We don't want layer annotation on certain nodes
+            if etree_to_dict(nodes[n])['@{http://www.w3.org/2001/XMLSchema-instance}type'] not in BASE_LAYERS:
+                if n < len(nodes):
+                    if "layers" in nodes[n].attrib:
+                        nodes[n].attrib["layers"] += f" //@layers.{i}"
+                    else:
+                        nodes[n].attrib["layers"] = f"//@layers.{i}"
+                if n < len(edges):
+                    if "layers" in edges[n].attrib:
+                        edges[n].attrib["layers"] += f" //@layers.{i}"
+                    else:
+                        edges[n].attrib["layers"] = f"//@layers.{i}"
 
         yield E.layers({
             "{http://www.w3.org/2001/XMLSchema-instance}type": "saltCore:SLayer",
-                    "nodes": " ".join(f"//@nodes.{n}" for n in layer["nodes"]),
+                    "nodes": " ".join(f"//@nodes.{n}" for n in range(2, node_ix+1)),
                     "edges": " ".join(f"//@edges.{n}" for n in layer["edges"])
                 },
                 E.labels({
@@ -424,21 +587,21 @@ def convert_inline_annotations(word, layers, **kwargs):
     """
     Birch specific: grab desc annotations in <pos></pos> and convert to SAnnotations.
     """
-    pos_annotations = [i for i in word.json()['children'] if i['type'] == 'pos']
-    for annotation in pos_annotations:
-        description = [i for i in annotation['children'] if i['type'] == 'desc']
-        if description:
-            for feat in description[0]['value'].split(','):
-                feat = feat.strip()
-                if not feat.strip() in FEAT_DICT:
-                    logger.yellow(f"ERROR: Unkown feature {feat}")
-                else:
-                    yield E.labels({
-                        "{http://www.w3.org/2001/XMLSchema-instance}type": "saltCore:SAnnotation",
-                            "namespace": "salt",
-                            "name": FEAT_DICT[feat],
-                            "value": "T::" + feat
-                    })
+    # pos_annotations = [i for i in word.json()['children'] if i['type'] == 'pos']
+    # for annotation in pos_annotations:
+    #     description = [i for i in annotation['children'] if i['type'] == 'desc']
+    #     if description:
+    #         for feat in description[0]['value'].split(','):
+    #             feat = feat.strip()
+    #             if not feat.strip() in FEAT_DICT:
+    #                 logger.yellow(f"ERROR: Unkown feature {feat}")
+    #             else:
+    #                 yield E.labels({
+    #                     "{http://www.w3.org/2001/XMLSchema-instance}type": "saltCore:SAnnotation",
+    #                         "namespace": "salt",
+    #                         "name": FEAT_DICT[feat],
+    #                         "value": "T::" + feat
+    #                 })
 
 
         # if not kwargs['saltonly']:
@@ -647,9 +810,6 @@ def convert_identifier(annotation, **kwargs):
 def create_sstructure(doc, sstructure_ix, **kwargs):
     """
     Takes in doc and cat, and creates sstructure node to connect others to.
-    Also creates SDominanceRelation (?)
-        - cat is the name of the most parent node, something like "S" or "UTT".
-        - ID is passed in through sstructure_ix in kwargs.
     """
     return E.nodes({
             "{http://www.w3.org/2001/XMLSchema-instance}type": "sDocumentStructure:SStructure"
@@ -696,6 +856,8 @@ def create_dominance_relation(doc, dom_rel_ix, source_node_ix, target_node_ix, *
             "value": "T::structure" + str(dom_rel_ix), #this can be huge!
         })
     )
+
+
 
 
 # def convert_type_information(annotation, **kwargs):
